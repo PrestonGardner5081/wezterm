@@ -31,7 +31,9 @@ use wayland_client::protocol::wl_keyboard::WlKeyboard;
 use wayland_client::protocol::wl_output::WlOutput;
 use wayland_client::{delegate_dispatch, Connection, QueueHandle};
 use wayland_protocols::ext::background_effect::v1::client::ext_background_effect_manager_v1::ExtBackgroundEffectManagerV1;
+use wayland_protocols::wp::fractional_scale::v1::client::wp_fractional_scale_manager_v1::WpFractionalScaleManagerV1;
 use wayland_protocols::wp::text_input::zv3::client::zwp_text_input_manager_v3::ZwpTextInputManagerV3;
+use wayland_protocols::wp::viewporter::client::wp_viewporter::WpViewporter;
 use wayland_protocols::wp::text_input::zv3::client::zwp_text_input_v3::ZwpTextInputV3;
 use wayland_protocols_plasma::blur::client::org_kde_kwin_blur_manager::OrgKdeKwinBlurManager;
 
@@ -92,6 +94,10 @@ pub(super) struct WaylandState {
     pub(super) kde_blur_manager: Option<OrgKdeKwinBlurManager>,
     pub(super) ext_background_effect_manager: Option<ExtBackgroundEffectManagerV1>,
     pub(super) ext_background_effect_can_blur: bool,
+    /// wp_fractional_scale_manager_v1 + wp_viewporter; both are needed to
+    /// render at a fractional scale. None if unsupported by the compositor.
+    pub(super) fractional_scale_manager: Option<WpFractionalScaleManagerV1>,
+    pub(super) viewporter: Option<WpViewporter>,
 }
 
 impl WaylandState {
@@ -107,6 +113,15 @@ impl WaylandState {
             globals.bind(qh, 1..=1, GlobalData).ok();
         let ext_background_effect_manager: Option<ExtBackgroundEffectManagerV1> =
             globals.bind(qh, 1..=1, GlobalData).ok();
+        let (fractional_scale_manager, viewporter) =
+            if config::configuration().wayland_fractional_scaling {
+                (
+                    globals.bind(qh, 1..=1, GlobalData).ok(),
+                    globals.bind(qh, 1..=1, GlobalData).ok(),
+                )
+            } else {
+                (None, None)
+            };
         let wayland_state = WaylandState {
             registry: RegistryState::new(globals),
             output: OutputState::new(globals, qh),
@@ -142,6 +157,8 @@ impl WaylandState {
             kde_blur_manager,
             ext_background_effect_manager,
             ext_background_effect_can_blur: false,
+            fractional_scale_manager,
+            viewporter,
         };
         Ok(wayland_state)
     }

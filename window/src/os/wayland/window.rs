@@ -44,6 +44,12 @@ use wayland_client::{Connection as WConnection, Dispatch, Proxy, QueueHandle};
 use wayland_egl::{is_available as egl_is_available, WlEglSurface};
 use wayland_protocols::ext::background_effect::v1::client::ext_background_effect_manager_v1::ExtBackgroundEffectManagerV1;
 use wayland_protocols::ext::background_effect::v1::client::ext_background_effect_surface_v1::ExtBackgroundEffectSurfaceV1;
+use wayland_protocols::wp::fractional_scale::v1::client::wp_fractional_scale_manager_v1::WpFractionalScaleManagerV1;
+use wayland_protocols::wp::fractional_scale::v1::client::wp_fractional_scale_v1::{
+    Event as WpFractionalScaleEvent, WpFractionalScaleV1,
+};
+use wayland_protocols::wp::viewporter::client::wp_viewport::WpViewport;
+use wayland_protocols::wp::viewporter::client::wp_viewporter::WpViewporter;
 use wayland_protocols_plasma::blur::client::org_kde_kwin_blur::OrgKdeKwinBlur;
 use wayland_protocols_plasma::blur::client::org_kde_kwin_blur_manager::OrgKdeKwinBlurManager;
 use wezterm_font::FontConfiguration;
@@ -287,9 +293,31 @@ impl WaylandWindow {
         let (x, y) = window_frame.location();
         let surface_width = dimensions.pixels_to_surface(dimensions.pixel_width as i32);
         let surface_height = dimensions.pixels_to_surface(dimensions.pixel_height as i32);
+        let (outer_width, outer_height) =
+            window_frame.add_borders(surface_width as u32, surface_height as u32);
         window
             .xdg_surface()
-            .set_window_geometry(x, y, surface_width, surface_height);
+            .set_window_geometry(x, y, outer_width as i32, outer_height as i32);
+
+        // Fractional scaling: the compositor tells us the exact preferred
+        // scale (eg: 1.25) and we render a buffer of that size, using a
+        // viewport to map it back onto the surface-local size.  Without this
+        // the compositor would have us render at the next integer scale
+        // and then downsample the result, which blurs text.
+        let (fractional_scale, viewport) = {
+            let wayland_state = conn.wayland_state.borrow();
+            match (
+                wayland_state.fractional_scale_manager.as_ref(),
+                wayland_state.viewporter.as_ref(),
+            ) {
+                (Some(manager), Some(viewporter)) => (
+                    Some(manager.get_fractional_scale(&surface, &qh, window_id)),
+                    Some(viewporter.get_viewport(&surface, &qh, GlobalData)),
+                ),
+                _ => (None, None),
+            }
+        };
+
         window.commit();
 
         let pending_mouse = PendingMouse::create(window_id);
@@ -335,6 +363,10 @@ impl WaylandWindow {
             wegl_surface: None,
             gl_state: None,
             ext_background_effect_surface: None,
+
+            fractional_scale,
+            viewport,
+            preferred_fractional_scale: None,
         }));
 
         let window_handle = Window::Wayland(WaylandWindow(window_id));
@@ -614,12 +646,126 @@ pub struct WaylandWindowInner {
     wegl_surface: Option<WlEglSurface>,
     gl_state: Option<Rc<glium::backend::Context>>,
     ext_background_effect_surface: Option<ExtBackgroundEffectSurfaceV1>,
+    // Per-surface wp_fractional_scale_v1; its preferred_scale events
+    // land in preferred_fractional_scale.
+    fractional_scale: Option<WpFractionalScaleV1>,
+    viewport: Option<WpViewport>,
+    preferred_fractional_scale: Option<f64>,
 }
 
 impl WaylandWindowInner {
     fn close(&mut self) {
         self.events.dispatch(WindowEvent::Destroyed);
+        if let Some(viewport) = self.viewport.take() {
+            viewport.destroy();
+        }
+        if let Some(fractional_scale) = self.fractional_scale.take() {
+            fractional_scale.destroy();
+        }
         self.window.take();
+    }
+
+    /// True when the compositor has told us a fractional scale and we
+    /// have a viewport to present the buffer at that scale.
+    fn using_fractional_scale(&self) -> bool {
+        self.viewport.is_some() && self.preferred_fractional_scale.is_some()
+    }
+
+    /// The scale factor we render at: the compositor's preferred
+    /// fractional scale if we can use it, else the integer buffer scale.
+    fn effective_scale_factor(&self) -> f64 {
+        if self.using_fractional_scale() {
+            self.preferred_fractional_scale.unwrap()
+        } else {
+            SurfaceUserData::from_wl(self.surface())
+                .surface_data
+                .scale_factor() as f64
+        }
+    }
+
+    /// The wl_surface buffer_scale to use. Must stay 1 when presenting
+    /// through a fractional-scale viewport.
+    fn buffer_scale(&self) -> i32 {
+        if self.using_fractional_scale() {
+            1
+        } else {
+            SurfaceUserData::from_wl(self.surface())
+                .surface_data
+                .scale_factor()
+        }
+    }
+
+    /// Convert a surface-local length to buffer pixels for a configure.
+    fn configure_surface_to_pixels(&self, surface: u32) -> i32 {
+        if self.using_fractional_scale() {
+            // wp_fractional_scale_v1: the toplevel buffer size is the
+            // surface size times the scale, rounded half away from zero.
+            (surface as f64 * self.get_dpi_factor()).round() as i32
+        } else {
+            self.surface_to_pixels(surface.try_into().unwrap())
+        }
+    }
+
+    pub(super) fn set_preferred_fractional_scale(&mut self, scale: f64) {
+        if self.preferred_fractional_scale == Some(scale) {
+            return;
+        }
+        log::debug!("preferred fractional scale is now {scale}");
+        self.preferred_fractional_scale.replace(scale);
+        self.queue_rescale();
+    }
+
+    /// Re-run configure at the current size so a scale change takes effect.
+    pub(super) fn queue_rescale(&mut self) {
+        if self.window.is_none() || self.pending_first_configure.is_some() {
+            // Closing, or not configured yet: we must not attach a buffer
+            // before the first configure, which will pick up the new scale.
+            return;
+        }
+        self.pending_event
+            .lock()
+            .unwrap()
+            .dpi
+            .replace((self.effective_scale_factor() * crate::DEFAULT_DPI) as i32);
+        self.dispatch_pending_event();
+    }
+
+    /// Show or hide our client side frame based on the decoration mode
+    /// the compositor actually agreed to.  Compositors that don't
+    /// implement xdg-decoration (eg: GNOME/mutter) always report Client,
+    /// so a request for server side decorations is never honored there
+    /// and we have to draw the frame ourselves.
+    /// Returns true if the frame visibility changed.
+    fn apply_decoration_mode(&mut self, mode: DecorationMode) -> bool {
+        let hidden = match mode {
+            DecorationMode::Server => true,
+            DecorationMode::Client => !self
+                .config
+                .window_decorations
+                .contains(WindowDecorations::TITLE),
+        };
+        if hidden == self.window_frame.is_hidden() {
+            return false;
+        }
+        log::debug!("decoration mode {mode:?}: client side frame hidden={hidden}");
+        self.window_frame.set_hidden(hidden);
+        true
+    }
+
+    /// The current content size in surface-local coordinates.
+    fn content_surface_size(&self) -> (u32, u32) {
+        if self.using_fractional_scale() {
+            let factor = self.get_dpi_factor();
+            (
+                (self.dimensions.pixel_width as f64 / factor).round() as u32,
+                (self.dimensions.pixel_height as f64 / factor).round() as u32,
+            )
+        } else {
+            (
+                self.pixels_to_surface(self.dimensions.pixel_width as i32) as u32,
+                self.pixels_to_surface(self.dimensions.pixel_height as i32) as u32,
+            )
+        }
     }
 
     fn show(&mut self) {
@@ -665,8 +811,7 @@ impl WaylandWindowInner {
             // Align pixel dimensions to the integer buffer scale factor
             // to satisfy the Wayland protocol requirement that buffer
             // dimensions must be an integer multiple of the buffer_scale.
-            let surface_udata = SurfaceUserData::from_wl(window.wl_surface());
-            let scale = surface_udata.surface_data.scale_factor();
+            let scale = self.buffer_scale();
             let pixel_width = (self.dimensions.pixel_width as i32 / scale) * scale;
             let pixel_height = (self.dimensions.pixel_height as i32 / scale) * scale;
 
@@ -848,28 +993,51 @@ impl WaylandWindowInner {
             self.window_state = window_state;
         }
 
-        if pending.configure.is_none() {
-            if pending.dpi.is_some() {
-                // Synthesize a pending configure event for the dpi change
-                pending.configure.replace((
-                    self.pixels_to_surface(self.dimensions.pixel_width as i32) as u32,
-                    self.pixels_to_surface(self.dimensions.pixel_height as i32) as u32,
-                ));
-                log::debug!("synthesize configure with {:?}", pending.configure);
-            }
-        }
+        let first_configure = pending.had_configure_event && self.pending_first_configure.is_some();
 
         if let Some(ref window_config) = pending.window_configure {
             self.window_frame.update_state(window_config.state);
             self.window_frame
                 .update_wm_capabilities(window_config.capabilities);
+            let frame_changed = self.window.is_some()
+                && self.apply_decoration_mode(window_config.decoration_mode);
+            if frame_changed {
+                pending.refresh_decorations = true;
+            }
+            if (frame_changed || first_configure) && pending.configure.is_none() {
+                // The compositor left the size up to us (or the frame
+                // appeared/vanished without a new size); re-apply the
+                // current content size so that the window geometry
+                // accounts for the frame and the current scale.
+                let (w, h) = self.content_surface_size();
+                pending.configure.replace(self.window_frame.add_borders(w, h));
+            }
         }
 
-        if let Some((mut w, mut h)) = pending.configure.take() {
-            log::trace!("Pending configure: w:{w}, h{h} -- {:?}", self.window);
+        if pending.configure.is_none() {
+            if pending.dpi.is_some() {
+                // Synthesize a pending configure event for the dpi change
+                let (w, h) = self.content_surface_size();
+                pending.configure.replace(self.window_frame.add_borders(w, h));
+                log::debug!("synthesize configure with {:?}", pending.configure);
+            }
+        }
+
+        // Note that pending.configure holds the size of the window geometry,
+        // which includes our client side frame (if any), not just the
+        // content area.
+        if let Some((outer_w, outer_h)) = pending.configure.take() {
+            log::trace!("Pending configure: w:{outer_w}, h{outer_h} -- {:?}", self.window);
             if self.window.is_some() {
-                let surface_udata = SurfaceUserData::from_wl(self.surface());
-                let factor = surface_udata.surface_data.scale_factor() as f64;
+                let (mut w, mut h) = match (NonZeroU32::new(outer_w), NonZeroU32::new(outer_h)) {
+                    (Some(ow), Some(oh)) => {
+                        let (iw, ih) = self.window_frame.subtract_borders(ow, oh);
+                        (iw.map(|v| v.get()).unwrap_or(1), ih.map(|v| v.get()).unwrap_or(1))
+                    }
+                    _ => (outer_w.max(1), outer_h.max(1)),
+                };
+                let fractional = self.using_fractional_scale();
+                let factor = self.effective_scale_factor();
                 let old_dimensions = self.dimensions;
 
                 // FIXME: teach this how to resolve dpi_by_screen
@@ -878,8 +1046,8 @@ impl WaylandWindowInner {
                 // Do this early because this affects surface_to_pixels/pixels_to_surface
                 self.dimensions.dpi = dpi;
 
-                let mut pixel_width = self.surface_to_pixels(w.try_into().unwrap());
-                let mut pixel_height = self.surface_to_pixels(h.try_into().unwrap());
+                let mut pixel_width = self.configure_surface_to_pixels(w);
+                let mut pixel_height = self.configure_surface_to_pixels(h);
 
                 if self.window_state.can_resize() {
                     self.window_frame.set_resizable(true);
@@ -893,34 +1061,55 @@ impl WaylandWindowInner {
                             max(pixel_height - extra_height, min_height as i32);
                         w = self.pixels_to_surface(desired_pixel_width) as u32;
                         h = self.pixels_to_surface(desired_pixel_height) as u32;
-                        pixel_width = self.surface_to_pixels(w.try_into().unwrap());
-                        pixel_height = self.surface_to_pixels(h.try_into().unwrap());
+                        pixel_width = self.configure_surface_to_pixels(w);
+                        pixel_height = self.configure_surface_to_pixels(h);
                     }
                 }
 
-                // Align pixel dimensions to the integer buffer scale factor
-                // to satisfy the Wayland protocol requirement that buffer
-                // dimensions must be an integer multiple of the buffer_scale.
-                let scale = factor as i32;
-                pixel_width = (pixel_width / scale) * scale;
-                pixel_height = (pixel_height / scale) * scale;
+                let (surface_width, surface_height) = if fractional {
+                    // The viewport maps the buffer onto exactly this
+                    // surface size, so there is no alignment to do.
+                    (w as i32, h as i32)
+                } else {
+                    // Align pixel dimensions to the integer buffer scale factor
+                    // to satisfy the Wayland protocol requirement that buffer
+                    // dimensions must be an integer multiple of the buffer_scale.
+                    let scale = factor as i32;
+                    pixel_width = (pixel_width / scale) * scale;
+                    pixel_height = (pixel_height / scale) * scale;
+                    (
+                        self.pixels_to_surface(pixel_width),
+                        self.pixels_to_surface(pixel_height),
+                    )
+                };
 
                 log::trace!("Resizing frame");
                 if !self.window_frame.is_hidden() {
                     // Clamp the size to at least one surface heigh/width.
-                    let width = NonZeroU32::new(w).unwrap_or(NonZeroU32::new(1).unwrap());
-                    let height = NonZeroU32::new(h).unwrap_or(NonZeroU32::new(1).unwrap());
+                    let width = NonZeroU32::new(surface_width as u32)
+                        .unwrap_or(NonZeroU32::new(1).unwrap());
+                    let height = NonZeroU32::new(surface_height as u32)
+                        .unwrap_or(NonZeroU32::new(1).unwrap());
                     self.window_frame.resize(width, height);
                     pending.refresh_decorations = true
                 }
                 let (x, y) = self.window_frame.location();
-                let surface_width = self.pixels_to_surface(pixel_width);
-                let surface_height = self.pixels_to_surface(pixel_height);
+                let (outer_width, outer_height) = self
+                    .window_frame
+                    .add_borders(surface_width as u32, surface_height as u32);
                 self.window
                     .as_mut()
                     .unwrap()
                     .xdg_surface()
-                    .set_window_geometry(x, y, surface_width, surface_height);
+                    .set_window_geometry(x, y, outer_width as i32, outer_height as i32);
+                if let Some(viewport) = self.viewport.as_ref() {
+                    if fractional {
+                        viewport.set_destination(surface_width, surface_height);
+                    } else {
+                        // -1,-1 unsets the destination: plain buffer_scale applies
+                        viewport.set_destination(-1, -1);
+                    }
+                }
                 // Compute the new pixel dimensions
                 let new_dimensions = Dimensions {
                     pixel_width: pixel_width.try_into().unwrap(),
@@ -955,7 +1144,10 @@ impl WaylandWindowInner {
                     if let Some(wegl_surface) = self.wegl_surface.as_mut() {
                         wegl_surface.resize(pixel_width, pixel_height, 0, 0);
                     }
-                    if self.surface_factor != factor {
+                    // When presenting through a fractional viewport the
+                    // buffer_scale must be 1.
+                    let buffer_scale = self.buffer_scale() as f64;
+                    if self.surface_factor != buffer_scale {
                         let wayland_conn = Connection::get().unwrap().wayland();
                         let wayland_state = wayland_conn.wayland_state.borrow();
                         let mut pool = wayland_state.mem_pool.borrow_mut();
@@ -964,14 +1156,14 @@ impl WaylandWindowInner {
                         // simply detaching the buffer can cause wlroots-derived
                         // compositors consider the window to be unconfigured.
                         if let Ok((buffer, _bytes)) = pool.create_buffer(
-                            factor as i32,
-                            factor as i32,
-                            (factor * 4.0) as i32,
+                            buffer_scale as i32,
+                            buffer_scale as i32,
+                            (buffer_scale * 4.0) as i32,
                             wayland_client::protocol::wl_shm::Format::Argb8888,
                         ) {
                             self.surface().attach(Some(buffer.wl_buffer()), 0, 0);
-                            self.surface().set_buffer_scale(factor as i32);
-                            self.surface_factor = factor;
+                            self.surface().set_buffer_scale(buffer_scale as i32);
+                            self.surface_factor = buffer_scale;
                         }
                     }
                     self.update_window_background_blur();
@@ -1037,16 +1229,17 @@ impl WaylandWindowInner {
                 if self.text_cursor.map(|prior| prior != rect).unwrap_or(true) {
                     self.text_cursor.replace(rect);
 
-                    let surface_udata = SurfaceUserData::from_wl(&surface);
-                    let factor = surface_udata.surface_data().scale_factor();
+                    // rect is in buffer pixels; text-input wants
+                    // surface-local coordinates.
+                    let factor = self.get_dpi_factor();
 
                     if let Some(text_input) = &state.text_input {
                         if let Some(input) = text_input.get_text_input_for_surface(&surface) {
                             input.set_cursor_rectangle(
-                                rect.min_x() as i32 / factor,
-                                rect.min_y() as i32 / factor,
-                                rect.width() as i32 / factor,
-                                rect.height() as i32 / factor,
+                                (rect.min_x() as f64 / factor) as i32,
+                                (rect.min_y() as f64 / factor) as i32,
+                                (rect.width() as f64 / factor) as i32,
+                                (rect.height() as f64 / factor) as i32,
                             );
                             input.commit();
                         }
@@ -1083,11 +1276,14 @@ impl WaylandWindowInner {
         // so we're going to fake one up, otherwise the window
         // contents don't reflect the real size until eg:
         // the focus is changed.
+        // Configure sizes are window geometry sizes, which include
+        // the client side frame.
+        let outer_size = self.window_frame.add_borders(surface_width, surface_height);
         self.pending_event
             .lock()
             .unwrap()
             .configure
-            .replace((surface_width, surface_height));
+            .replace(outer_size);
         // apply the synthetic configure event to the inner surfaces
         self.dispatch_pending_event();
 
@@ -1445,10 +1641,22 @@ impl CompositorHandler for WaylandState {
         &mut self,
         _conn: &WConnection,
         _qh: &wayland_client::QueueHandle<Self>,
-        _surface: &wayland_client::protocol::wl_surface::WlSurface,
-        _new_factor: i32,
+        surface: &wayland_client::protocol::wl_surface::WlSurface,
+        new_factor: i32,
     ) {
-        // We do nothing, we get the scale_factor from surface_data
+        // The new factor is already stored in surface_data, but nothing
+        // else will make us re-render at it until the next configure,
+        // so queue a rescale now.  Frame subsurfaces don't carry
+        // SurfaceUserData and are skipped.
+        let Some(surface_data) = SurfaceUserData::try_from_wl(surface) else {
+            return;
+        };
+        let window_id = surface_data.window_id;
+        log::debug!("integer scale factor for window {window_id} is now {new_factor}");
+        WaylandConnection::with_window_inner(window_id, |inner| {
+            inner.queue_rescale();
+            Ok(())
+        });
     }
 
     fn frame(
@@ -1542,6 +1750,67 @@ impl Dispatch<OrgKdeKwinBlur, GlobalData> for WaylandState {
         _qhandle: &wayland_client::QueueHandle<Self>,
     ) {
         // No events from OrgKdeKwinBlur...
+    }
+}
+
+impl Dispatch<WpFractionalScaleManagerV1, GlobalData> for WaylandState {
+    fn event(
+        _state: &mut Self,
+        _proxy: &WpFractionalScaleManagerV1,
+        _event: <WpFractionalScaleManagerV1 as Proxy>::Event,
+        _data: &GlobalData,
+        _conn: &WConnection,
+        _qhandle: &QueueHandle<Self>,
+    ) {
+        // No events from WpFractionalScaleManagerV1
+    }
+}
+
+/// The user data is the window_id that the fractional scale object
+/// was created for.
+impl Dispatch<WpFractionalScaleV1, usize> for WaylandState {
+    fn event(
+        _state: &mut Self,
+        _proxy: &WpFractionalScaleV1,
+        event: <WpFractionalScaleV1 as Proxy>::Event,
+        window_id: &usize,
+        _conn: &WConnection,
+        _qhandle: &QueueHandle<Self>,
+    ) {
+        if let WpFractionalScaleEvent::PreferredScale { scale } = event {
+            // The scale is sent as a fixed point numerator over 120
+            let scale = scale as f64 / 120.0;
+            WaylandConnection::with_window_inner(*window_id, move |inner| {
+                inner.set_preferred_fractional_scale(scale);
+                Ok(())
+            });
+        }
+    }
+}
+
+impl Dispatch<WpViewporter, GlobalData> for WaylandState {
+    fn event(
+        _state: &mut Self,
+        _proxy: &WpViewporter,
+        _event: <WpViewporter as Proxy>::Event,
+        _data: &GlobalData,
+        _conn: &WConnection,
+        _qhandle: &QueueHandle<Self>,
+    ) {
+        // No events from WpViewporter
+    }
+}
+
+impl Dispatch<WpViewport, GlobalData> for WaylandState {
+    fn event(
+        _state: &mut Self,
+        _proxy: &WpViewport,
+        _event: <WpViewport as Proxy>::Event,
+        _data: &GlobalData,
+        _conn: &WConnection,
+        _qhandle: &QueueHandle<Self>,
+    ) {
+        // No events from WpViewport
     }
 }
 

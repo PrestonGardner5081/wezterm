@@ -359,12 +359,26 @@ impl WebGpuState {
             vec![]
         };
 
+        // On Wayland the window layer already paces painting with
+        // wl_surface.frame callbacks, so Fifo would add a second, driver
+        // side throttle on top of that, which shows up as latency and
+        // uneven frame times.  Mailbox presents the newest frame without
+        // blocking; our frame callbacks keep it from spinning.
+        let present_mode = if matches!(handle.window, RawWindowHandle::Wayland(_))
+            && caps.present_modes.contains(&wgpu::PresentMode::Mailbox)
+        {
+            wgpu::PresentMode::Mailbox
+        } else {
+            wgpu::PresentMode::Fifo
+        };
+        log::debug!("webgpu present_mode: {present_mode:?} (available: {:?})", caps.present_modes);
+
         let config = wgpu::SurfaceConfiguration {
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
             format,
             width: dimensions.pixel_width as u32,
             height: dimensions.pixel_height as u32,
-            present_mode: wgpu::PresentMode::Fifo,
+            present_mode,
             alpha_mode: if caps
                 .alpha_modes
                 .contains(&wgpu::CompositeAlphaMode::PostMultiplied)

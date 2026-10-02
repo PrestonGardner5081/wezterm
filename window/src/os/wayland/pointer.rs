@@ -261,6 +261,8 @@ impl WaylandState {
                     }
                     _ => {}
                 }
+                // Hover/press feedback on the decorations
+                inner.refresh_frame();
             }
         }
     }

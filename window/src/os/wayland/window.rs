@@ -28,7 +28,6 @@ use smithay_client_toolkit::reexports::csd_frame::{
 };
 use smithay_client_toolkit::reexports::protocols::xdg::shell::client::xdg_toplevel::ResizeEdge as XdgResizeEdge;
 use smithay_client_toolkit::seat::pointer::CursorIcon;
-use smithay_client_toolkit::shell::xdg::fallback_frame::FallbackFrame;
 use smithay_client_toolkit::shell::xdg::window::{
     DecorationMode, Window as XdgWindow, WindowConfigure, WindowDecorations as Decorations,
     WindowHandler,
@@ -89,6 +88,7 @@ impl WaylandDimensions for Dimensions {
     }
 }
 
+use super::header_frame::HeaderBarFrame;
 use super::pointer::{PendingMouse, PointerUserData};
 use super::state::WaylandState;
 
@@ -272,8 +272,13 @@ impl WaylandWindow {
             let wayland_state = &conn.wayland_state.borrow();
             let shm = &wayland_state.shm;
             let subcompositor = wayland_state.subcompositor.clone();
-            FallbackFrame::new(&window, shm, subcompositor, qh.clone())
-                .expect("failed to create csd frame")
+            HeaderBarFrame::new(
+                window.wl_surface(),
+                shm,
+                subcompositor,
+                qh.clone(),
+                config.clone(),
+            )?
         };
         let hidden = match decor_mode {
             Some(DecorationMode::Client) => false,
@@ -617,7 +622,7 @@ pub struct WaylandWindowInner {
     pub(crate) events: WindowEventSender,
     surface_factor: f64,
     window: Option<XdgWindow>,
-    pub(super) window_frame: FallbackFrame<WaylandState>,
+    pub(super) window_frame: HeaderBarFrame,
     dimensions: Dimensions,
     resize_increments: Option<ResizeIncrement>,
     window_state: WindowState,
@@ -787,7 +792,7 @@ impl WaylandWindowInner {
         self.do_paint().unwrap();
     }
 
-    fn refresh_frame(&mut self) {
+    pub(super) fn refresh_frame(&mut self) {
         if self.window_frame.is_dirty() && !self.window_frame.is_hidden() {
             self.window_frame.draw();
         }
@@ -1084,6 +1089,7 @@ impl WaylandWindowInner {
                 };
 
                 log::trace!("Resizing frame");
+                self.window_frame.set_scaling_factor(factor);
                 if !self.window_frame.is_hidden() {
                     // Clamp the size to at least one surface heigh/width.
                     let width = NonZeroU32::new(surface_width as u32)
@@ -1258,6 +1264,7 @@ impl WaylandWindowInner {
         if let Some(window) = self.window.as_ref() {
             window.set_title(title.clone());
         }
+        self.window_frame.set_title(title.clone());
         self.refresh_frame();
         self.title = Some(title);
     }
@@ -1482,6 +1489,8 @@ impl WaylandWindowInner {
 
     fn config_did_change(&mut self, config: ConfigHandle) {
         self.config = config;
+        self.window_frame.set_config(self.config.clone());
+        self.refresh_frame();
         self.update_window_background_blur();
     }
 
